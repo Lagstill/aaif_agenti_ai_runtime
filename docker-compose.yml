@@ -1,0 +1,122 @@
+# The whole runtime in one file. Asymmetries the audience should see:
+#   - agents reach only the gateway, plus the LLM host via an allowlist proxy
+#   - the gateway has NO internet; each agent's OpenGAP dir is mounted read-only
+#   - only tool-memory, agent /state, and ollama are writable; all but ollama drop every cap
+
+networks:
+  agents_net:        # agents <-> gateway, agents <-> llm-egress
+    internal: true
+  gateway_net:       # gateway <-> tools <-> ollama
+    internal: true
+  egress_net:        # public internet: webpage fetches, model pull, Claude, UI port
+    driver: bridge
+
+x-hardened: &hardened
+  read_only: true
+  tmpfs: ["/tmp"]
+  cap_drop: ["ALL"]
+
+x-agent: &agent
+  <<: *hardened
+  build: ./agents
+  networks: [agents_net]
+  depends_on: [gateway, llm-egress]
+
+x-agent-env: &agent-env
+  # No value = passed through from .env only if set: a direct key, or a proxy URL + token.
+  ANTHROPIC_API_KEY:
+  ANTHROPIC_BASE_URL:
+  ANTHROPIC_AUTH_TOKEN:
+  HTTPS_PROXY: http://llm-egress:3128        # the only way out: the LLM host, nothing else
+
+services:
+  ui:
+    <<: *hardened
+    build: ./ui
+    container_name: ui
+    ports: ["8080:8080"]
+    environment: {GATEWAY_URL: "http://gateway:9000"}
+    # egress_net only because Docker can't publish ports from internal networks.
+    networks: [gateway_net, egress_net]
+    depends_on: [gateway]
+
+  gateway:
+    <<: *hardened
+    build: ./gateway
+    container_name: gateway
+    environment:
+      POLICY_FILE:  /app/policy.yaml
+      OLLAMA_URL:   http://ollama:11434      # unset it and the gateway uses MockScorer
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-phi3:mini}
+    volumes:
+      - ./gateway/policy.yaml:/app/policy.yaml:ro
+    networks: [agents_net, gateway_net]      # no egress_net, on purpose
+    depends_on: [ollama]                     # container start only; the model pull is async
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    environment: {OLLAMA_KEEP_ALIVE: 24h}  # default 5m unloads phi3; a cold reload blows the 5s budget
+    volumes:
+      - ollama-data:/root/.ollama            # model cached between runs
+    networks: [gateway_net, egress_net]      # egress to pull from registry.ollama.ai
+    # no cap_drop / read_only: ollama needs default caps and a writable home
+
+  llm-egress:
+    <<: *hardened
+    build: ./egress
+    container_name: llm-egress
+    environment: {ALLOW_HOSTS: "${LLM_EGRESS_HOST:-api.anthropic.com:443}"}
+    networks: [agents_net, egress_net]
+
+  # --- agents: one image, three identities. Who they are lives in ./agents/<name>/
+  agent-alice:
+    <<: *agent
+    container_name: agent-alice
+    environment:
+      <<: *agent-env
+      AGENT_TOKEN: 259d91f4b79515d318c524476c37427348feff141ac2f2b8   # = policy.yaml alice
+    volumes:
+      - ./agents/alice:/gap:ro
+      - alice-state:/state                   # continuity survives docker kill
+
+  agent-bob:
+    <<: *agent
+    container_name: agent-bob
+    environment:
+      <<: *agent-env
+      AGENT_TOKEN: 58b59305dabb9a1b166d03cd52a33c8c1fa554938613aec0   # = policy.yaml bob
+    volumes:
+      - ./agents/bob:/gap:ro
+      - bob-state:/state
+
+  agent-ops:
+    <<: *agent
+    container_name: agent-ops
+    environment:
+      <<: *agent-env
+      AGENT_TOKEN: ac81c99884cfb79ead3eb11aa9f57952a942854b1602d278   # = policy.yaml ops
+    volumes:
+      - ./agents/ops:/gap:ro
+      - ops-state:/state
+
+  # --- tools -------------------------------------------------------------------
+  tool-memory:
+    <<: *hardened
+    build: ./tools/memory
+    container_name: tool-memory
+    volumes: ["memory-data:/data"]          # memories survive restarts
+    networks: [gateway_net]                  # no egress
+
+  tool-webpage:
+    <<: *hardened
+    build: ./tools/webpage
+    container_name: tool-webpage
+    networks: [gateway_net, egress_net]      # needs the internet to fetch pages
+
+volumes:
+  memory-data:
+  alice-state:
+  bob-state:
+  ops-state:
+  ollama-data:
